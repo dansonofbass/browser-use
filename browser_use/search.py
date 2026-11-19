@@ -74,14 +74,17 @@ class WebSearch:
 			with urlopen_keyed(request, SEARCH_TIMEOUT_S) as r:
 				text = r.read().decode('utf-8', 'replace')
 		except urllib.error.HTTPError as e:
-			detail = self._clean(e.read().decode('utf-8', 'replace')[:300])
+			try:
+				detail = self._clean(e.read().decode('utf-8', 'replace')[:300])
+			except (OSError, http.client.HTTPException):  # keep the status when the error body broke off
+				detail = self._clean(str(e.reason))
 			budget = ' (run out of budget)' if e.code == 402 else ''
 			raise SearchError(f'Search failed: HTTP {e.code}{budget}: {detail}') from None
 		except (TimeoutError, urllib.error.URLError) as e:
 			if isinstance(e, TimeoutError) or isinstance(getattr(e, 'reason', None), TimeoutError):
 				raise SearchError(f'Search failed: timed out after {SEARCH_TIMEOUT_S:g} s.') from None
 			raise SearchError(f'Search failed: {self._clean(str(e))}') from None
-		except OSError as e:  # reset mid-read
+		except (OSError, http.client.HTTPException) as e:  # reset mid-read or malformed HTTP
 			raise SearchError(f'Search failed: {self._clean(str(e))}') from None
 		try:
 			parsed = json.loads(text)
@@ -114,7 +117,7 @@ class WebSearch:
 				try:
 					detail = self._clean(e.read().decode('utf-8', 'replace')[:300].strip())
 				except (OSError, http.client.HTTPException):  # the body broke off: the status alone is the answer
-					detail = e.reason
+					detail = self._clean(str(e.reason))
 				return f'Agent(web_search=True): Browser Use web search at {self.url} answered HTTP {e.code}: {detail}'
 		except (OSError, http.client.HTTPException):  # BadStatusLine, IncompleteRead are not OSError
 			pass

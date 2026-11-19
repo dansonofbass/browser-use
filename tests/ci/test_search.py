@@ -1,10 +1,13 @@
 """Agent(web_search=...): search() in the REPL, answered by the parent against a fake /api/v4/search. No browser."""
 
+import http.client
 import json
 import threading
 import time
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import MagicMock, Mock
+from urllib.error import HTTPError, URLError
 
 import pytest
 from conftest import script
@@ -118,6 +121,53 @@ def test_error_text_never_carries_the_key(endpoint):
 	with pytest.raises(SearchError) as e:
 		WebSearch(KEY, endpoint.url)('q')
 	assert KEY not in str(e.value) and '<api key>' in str(e.value)
+
+
+@pytest.mark.parametrize(
+	('error', 'during_read'),
+	[
+		(http.client.BadStatusLine(KEY), False),
+		(http.client.IncompleteRead(KEY.encode(), 100), True),
+		(OSError(f'connection failed: {KEY}'), False),
+		(OSError(f'read failed: {KEY}'), True),
+		(URLError(f'connection failed: {KEY}'), False),
+	],
+)
+def test_search_normalizes_and_redacts_transport_errors(monkeypatch, error, during_read):
+	search = WebSearch(KEY, 'http://unused.invalid/api/v4/search')
+	opener = MagicMock()
+	if during_read:
+		opener.return_value.__enter__.return_value.read.side_effect = error
+	else:
+		opener.side_effect = error
+	monkeypatch.setattr('browser_use.search.urlopen_keyed', opener)
+	with pytest.raises(SearchError, match='^Search failed:') as exc:
+		search('q')
+	assert KEY not in str(exc.value)
+	if KEY in str(error):
+		assert '<api key>' in str(exc.value)
+	assert search.charges == []
+
+
+@pytest.mark.parametrize('status', [401, 402, 403, 404, 429, 500])
+@pytest.mark.parametrize('error', [http.client.IncompleteRead(KEY.encode(), 100), OSError(KEY)])
+def test_search_keeps_http_status_when_error_body_cannot_be_read(monkeypatch, status, error):
+	response = Mock()
+	response.read.side_effect = error
+	http_error = HTTPError('http://unused.invalid/api/v4/search', status, f'Unavailable {KEY}', {}, response)
+	monkeypatch.setattr('browser_use.search.urlopen_keyed', Mock(side_effect=http_error))
+	search = WebSearch(KEY, http_error.url)
+	with pytest.raises(SearchError) as exc:
+		search('q')
+	budget = ' (run out of budget)' if status == 402 else ''
+	assert str(exc.value) == f'Search failed: HTTP {status}{budget}: Unavailable <api key>'
+	assert search.charges == []
+	line = search.preflight()
+	if status in (401, 402, 403, 404):
+		assert line and line.endswith(f'answered HTTP {status}: Unavailable <api key>')
+		assert KEY not in line
+	else:
+		assert line is None
 
 
 @pytest.mark.parametrize(
